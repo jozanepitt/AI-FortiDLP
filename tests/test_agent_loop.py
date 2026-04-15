@@ -1,75 +1,57 @@
-"""Tests for the Claude agent loop with mocked Anthropic + FortiDLP."""
+"""Tests for the Gemini agent loop with mocked google-genai + FortiDLP."""
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.agent.claude_client import ClaudeAgent
+from app.agent.claude_client import GeminiAgent
 
 
-class _Block(SimpleNamespace):
-    pass
+def _make_part(text: str | None = None, fc_name: str | None = None, fc_args: dict | None = None):
+    fc = SimpleNamespace(name=fc_name, args=fc_args or {}) if fc_name else None
+    return SimpleNamespace(text=text, function_call=fc)
 
 
-def _text_block(text: str) -> _Block:
-    return _Block(type="text", text=text)
-
-
-def _tool_use_block(id_: str, name: str, input_: dict) -> _Block:
-    return _Block(type="tool_use", id=id_, name=name, input=input_)
+def _make_response(*parts):
+    content = SimpleNamespace(parts=list(parts))
+    candidate = SimpleNamespace(content=content)
+    return SimpleNamespace(candidates=[candidate])
 
 
 @pytest.mark.asyncio
 async def test_agent_end_turn_without_tool_call():
-    agent = ClaudeAgent(api_key="x", model="claude-sonnet-4-5")
-    agent._client = MagicMock()
-    agent._client.messages = MagicMock()
-    agent._client.messages.create = AsyncMock(
-        return_value=SimpleNamespace(
-            stop_reason="end_turn",
-            content=[_text_block("All good.")],
-        )
-    )
+    agent = GeminiAgent(api_key="fake", model="gemini-2.0-flash")
 
-    result = await agent.ask("hello", fortidlp=MagicMock())
+    fake_resp = _make_response(_make_part(text="All good."))
+
+    with patch.object(agent._client.aio.models, "generate_content", new=AsyncMock(return_value=fake_resp)):
+        result = await agent.ask("hello", fortidlp=MagicMock())
+
     assert result["answer"] == "All good."
     assert result["trace"] == []
 
 
 @pytest.mark.asyncio
 async def test_agent_executes_tool_then_answers():
-    agent = ClaudeAgent(api_key="x", model="claude-sonnet-4-5")
-    agent._client = MagicMock()
-    agent._client.messages = MagicMock()
+    agent = GeminiAgent(api_key="fake", model="gemini-2.0-flash")
 
-    # First response: tool call. Second response: final text.
-    agent._client.messages.create = AsyncMock(
-        side_effect=[
-            SimpleNamespace(
-                stop_reason="tool_use",
-                content=[
-                    _tool_use_block(
-                        "tool_1",
-                        "get_top_users",
-                        {"period": "today", "limit": 1},
-                    )
-                ],
-            ),
-            SimpleNamespace(
-                stop_reason="end_turn",
-                content=[_text_block("Top user today: alice (42 events).")],
-            ),
-        ]
+    tool_resp = _make_response(
+        _make_part(fc_name="get_top_users", fc_args={"period": "today", "limit": 1})
     )
+    final_resp = _make_response(_make_part(text="Top user today: alice (42 events)."))
 
     fortidlp = MagicMock()
-    fortidlp.top_users = AsyncMock(
-        return_value=[{"user": "alice@example.com", "events": 42}]
-    )
+    fortidlp.top_users = AsyncMock(return_value=[{"user": "alice@example.com", "events": 42}])
 
-    result = await agent.ask("who is the top user today?", fortidlp)
+    with patch.object(
+        agent._client.aio.models,
+        "generate_content",
+        new=AsyncMock(side_effect=[tool_resp, final_resp]),
+    ):
+        result = await agent.ask("who is the top user today?", fortidlp)
+
     assert "alice" in result["answer"]
     assert len(result["trace"]) == 1
     assert result["trace"][0]["tool"] == "get_top_users"

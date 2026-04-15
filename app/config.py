@@ -8,8 +8,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    anthropic_api_key: str
-    claude_model: str = "claude-sonnet-4-5"
+    gemini_api_key: str
+    gemini_model: str = "gemini-2.0-flash"
 
     # FortiDLP event stream
     fortidlp_base_url: str

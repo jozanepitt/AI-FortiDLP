@@ -1,160 +1,166 @@
-"""Anthropic Claude tool-use loop for the FortiDLP agent.
+"""Gemini-backed agent loop with FortiDLP tool-use.
 
-Uses a manual agentic loop (rather than the SDK tool runner) because we
-need to dispatch each tool call through an async FortiDLPClient instance
-that is owned by the FastAPI request - the tool runner would require
-global or closure-captured state that's awkward in a web handler.
+Uses the new `google-genai` SDK (v1+) with a manual agentic loop so each
+tool call is dispatched through the async FortiDLPClient instance owned
+by the FastAPI request context.
 
-Prompt caching: the system prompt + tool list are stable across every
-request, so we mark the last system text block with cache_control. After
-the first request of a 5-minute window, subsequent requests hit the
-cache and pay ~0.1x for the shared prefix.
+ClaudeAgent is kept as an alias of GeminiAgent so existing imports work.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
-from anthropic import AsyncAnthropic
+from google import genai
+from google.genai import types
 
-from .fortidlp_client import FortiDLPClient
-from .tools import DISPATCH, TOOLS, run_tool
+from .tools import TOOLS, run_tool
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 5
 
 SYSTEM_PROMPT = (
-    "You are a read-only assistant for a FortiDLP (Fortinet Data Loss "
-    "Prevention) console. A security engineer asks you operational "
-    "questions about their tenant; you answer using the provided tools. "
-    "\n\nGuidelines:\n"
-    "- You may ONLY use the provided tools. Never claim to access the "
-    "console any other way.\n"
-    "- All tools are strictly read-only. Never imply you can change "
-    "policy, quarantine a device, or modify any state.\n"
-    "- When the user asks about unhealthy devices, always include both "
-    "the reason and a short suggested remediation step per device.\n"
-    "- Be terse. Security engineers scan answers fast; use short "
-    "paragraphs or bullet lists, not prose.\n"
-    "- If a tool returns an empty result, say so plainly. Do not make up "
-    "data.\n"
-    "- If you are unsure which tool to use, ask the user for "
-    "clarification before calling a tool."
+    "You are a read-only FortiDLP security analyst assistant for Capitec Bank. "
+    "Answer questions about DLP events, user activity, policy violations, and "
+    "endpoint detections by calling the available tools.\n"
+    "Guidelines:\n"
+    "- Only use the provided tools. Never fabricate data.\n"
+    "- All tools are strictly read-only.\n"
+    "- Be terse — use bullet lists, not prose.\n"
+    "- If a tool returns empty results, say so plainly.\n"
+    "- If the event cache has no data yet, explain that the stream needs time "
+    "to accumulate events."
 )
 
 
-class ClaudeAgent:
-    def __init__(self, api_key: str, model: str) -> None:
-        self._client = AsyncAnthropic(api_key=api_key)
+def _build_tools() -> list[types.Tool]:
+    """Convert our JSON-Schema TOOLS list to Gemini FunctionDeclaration objects."""
+    _type_map = {
+        "string": types.Type.STRING,
+        "integer": types.Type.INTEGER,
+        "number": types.Type.NUMBER,
+        "boolean": types.Type.BOOLEAN,
+        "array": types.Type.ARRAY,
+        "object": types.Type.OBJECT,
+    }
+
+    def _to_schema(spec: dict) -> types.Schema:
+        kwargs: dict[str, Any] = {
+            "type": _type_map.get(spec.get("type", "string"), types.Type.STRING),
+        }
+        if "description" in spec:
+            kwargs["description"] = spec["description"]
+        if "enum" in spec:
+            kwargs["enum"] = spec["enum"]
+        return types.Schema(**kwargs)
+
+    declarations = []
+    for t in TOOLS:
+        props = {
+            name: _to_schema(spec)
+            for name, spec in t["input_schema"].get("properties", {}).items()
+        }
+        declarations.append(
+            types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties=props,
+                ),
+            )
+        )
+    return [types.Tool(function_declarations=declarations)]
+
+
+class GeminiAgent:
+    """Agentic loop backed by Google Gemini 2.0 Flash with FortiDLP tool-use."""
+
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash") -> None:
+        self._client = genai.Client(api_key=api_key)
         self._model = model
+        self._tools = _build_tools()
 
-    async def ask(
-        self,
-        user_message: str,
-        fortidlp: FortiDLPClient,
-    ) -> dict[str, Any]:
-        """Run the agentic loop for a single user question.
+    async def ask(self, user_message: str, fortidlp: Any) -> dict[str, Any]:
+        """Run the agentic loop for one user question.
 
-        Returns a dict with `answer` (final text) and `trace` (list of
-        tool_name/args/result tuples) for display in the UI.
+        Returns dict with `answer` (final text) and `trace` (tool call log).
         """
-        messages: list[dict] = [{"role": "user", "content": user_message}]
+        contents: list[types.Content] = [
+            types.Content(role="user", parts=[types.Part(text=user_message)])
+        ]
         trace: list[dict] = []
 
-        for step in range(MAX_ITERATIONS):
-            response = await self._client.messages.create(
+        for iteration in range(MAX_ITERATIONS):
+            response = await self._client.aio.models.generate_content(
                 model=self._model,
-                max_tokens=2048,
-                system=[
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                tools=TOOLS,
-                messages=messages,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    tools=self._tools,
+                    system_instruction=SYSTEM_PROMPT,
+                ),
             )
 
-            if response.stop_reason == "end_turn":
-                answer = _extract_text(response.content)
-                return {"answer": answer, "trace": trace}
+            # Extract text and function calls from response parts
+            text_parts: list[str] = []
+            function_calls: list[types.FunctionCall] = []
 
-            if response.stop_reason != "tool_use":
-                # Unexpected stop (max_tokens, refusal, etc.). Return what we have.
-                answer = _extract_text(response.content) or (
-                    f"Agent stopped unexpectedly: {response.stop_reason}"
-                )
-                return {"answer": answer, "trace": trace}
+            try:
+                parts = response.candidates[0].content.parts
+            except (IndexError, AttributeError):
+                break
 
-            # Append assistant turn (must include the raw content blocks so
-            # tool_use IDs line up with tool_results below).
-            messages.append({"role": "assistant", "content": response.content})
+            for part in parts:
+                if part.function_call and part.function_call.name:
+                    function_calls.append(part.function_call)
+                elif part.text:
+                    text_parts.append(part.text)
 
-            tool_results: list[dict] = []
-            for block in response.content:
-                if getattr(block, "type", None) != "tool_use":
-                    continue
+            # No function calls → final answer
+            if not function_calls:
+                return {"answer": "".join(text_parts).strip() or "(no response)", "trace": trace}
 
-                name = block.name
-                args = block.input or {}
+            # Append model turn
+            contents.append(types.Content(role="model", parts=parts))
 
-                if name not in DISPATCH:
-                    result_text = f"Error: unknown tool '{name}'"
+            # Execute each tool and collect function_response parts
+            response_parts: list[types.Part] = []
+            for fc in function_calls:
+                args = dict(fc.args) if fc.args else {}
+                try:
+                    result = await run_tool(fc.name, args, fortidlp)
+                    is_error = False
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("tool %s failed", fc.name)
+                    result = {"error": str(exc)}
                     is_error = True
-                else:
-                    try:
-                        result = await run_tool(name, args, fortidlp)
-                        result_text = _to_text(result)
-                        is_error = False
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("tool %s failed", name)
-                        result_text = f"Error executing {name}: {exc}"
-                        is_error = True
 
-                trace.append(
-                    {
-                        "step": step,
-                        "tool": name,
-                        "args": args,
-                        "is_error": is_error,
-                        "result_preview": result_text[:500],
-                    }
+                trace.append({
+                    "step": iteration + 1,
+                    "tool": fc.name,
+                    "args": args,
+                    "is_error": is_error,
+                    "result_preview": json.dumps(result, default=str)[:500],
+                })
+
+                response_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=fc.name,
+                            response={"result": result},
+                        )
+                    )
                 )
 
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result_text,
-                        "is_error": is_error,
-                    }
-                )
-
-            messages.append({"role": "user", "content": tool_results})
+            contents.append(types.Content(role="user", parts=response_parts))
 
         return {
-            "answer": (
-                f"Agent hit the max-iteration cap ({MAX_ITERATIONS}). "
-                "Try asking a more specific question."
-            ),
+            "answer": f"Agent reached the {MAX_ITERATIONS}-step limit. Try a more specific question.",
             "trace": trace,
         }
 
 
-def _extract_text(content: list) -> str:
-    parts: list[str] = []
-    for block in content:
-        if getattr(block, "type", None) == "text":
-            parts.append(block.text)
-    return "\n".join(parts).strip()
-
-
-def _to_text(value: Any) -> str:
-    import json
-
-    try:
-        return json.dumps(value, default=str, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(value)
+# Backward-compatible alias — main.py imports ClaudeAgent
+ClaudeAgent = GeminiAgent

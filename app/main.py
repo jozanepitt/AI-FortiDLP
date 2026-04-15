@@ -31,8 +31,8 @@ async def lifespan(app: FastAPI):
         stream_token=settings.fortidlp_stream_token,
     )
     agent = ClaudeAgent(
-        api_key=settings.anthropic_api_key,
-        model=settings.claude_model,
+        api_key=settings.gemini_api_key,
+        model=settings.gemini_model,
     )
 
     app.state.fortidlp = fortidlp
