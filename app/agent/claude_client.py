@@ -78,7 +78,7 @@ def _build_tools() -> list[types.Tool]:
 class GeminiAgent:
     """Agentic loop backed by Google Gemini 2.0 Flash with FortiDLP tool-use."""
 
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash") -> None:
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash") -> None:
         self._client = genai.Client(api_key=api_key)
         self._model = model
         self._tools = _build_tools()

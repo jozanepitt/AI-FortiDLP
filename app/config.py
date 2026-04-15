@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     )
 
     gemini_api_key: str
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
 
     # FortiDLP event stream
     fortidlp_base_url: str
