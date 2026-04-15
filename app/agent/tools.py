@@ -73,7 +73,8 @@ TOOLS: list[dict] = [
         "name": "get_top_devices",
         "description": (
             "Return endpoints (by hostname) with the most DLP detections. "
-            "Useful for identifying the noisiest or most at-risk machines."
+            "Use for questions about device health, unhealthy devices, risky endpoints, "
+            "machines generating the most alerts, or endpoint risk overview."
         ),
         "input_schema": {
             "type": "object",
