@@ -18,5 +18,5 @@ def test_every_canned_references_existing_tool():
 
 
 def test_get_canned_by_id():
-    assert get_canned("unhealthy_devices") is not None
+    assert get_canned("top_user_today") is not None
     assert get_canned("nonexistent") is None

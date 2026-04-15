@@ -1,33 +1,18 @@
-"""Whitelisted query functions exposed to Claude as tools.
-
-Each entry in `TOOLS` is a tool definition matching Anthropic's tool-use
-schema. `DISPATCH` maps the tool name to an async Python function that
-takes the validated input dict and a `FortiDLPClient`, and returns a
-JSON-serializable result.
-
-Every function here is strictly read-only and wraps a single FortiDLP
-endpoint. Adding a new tool means adding BOTH a schema entry and a
-dispatch function - no freeform API access.
-"""
+"""Whitelisted tool schemas and dispatch table for Claude tool-use."""
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Awaitable, Callable
+from typing import Any
 
-from .fortidlp_client import FortiDLPClient
-
-logger = logging.getLogger(__name__)
-
-ToolFn = Callable[[dict, FortiDLPClient], Awaitable[Any]]
-
+log = logging.getLogger(__name__)
 
 TOOLS: list[dict] = [
     {
         "name": "get_top_users",
         "description": (
-            "Return the users with the most DLP policy triggers in a given "
-            "period. Use this to answer questions like 'who has the highest "
-            "activity today' or 'top offenders this week'."
+            "Return the most active users ranked by detection/incident count. "
+            "period: 'today' (since midnight), 'week' (past 7 days), 'month' (past 30 days)."
         ),
         "input_schema": {
             "type": "object",
@@ -35,23 +20,16 @@ TOOLS: list[dict] = [
                 "period": {
                     "type": "string",
                     "enum": ["today", "week", "month"],
-                    "description": "Time window to aggregate over.",
+                    "default": "today",
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max number of users to return (default 10).",
-                    "minimum": 1,
-                    "maximum": 100,
-                },
+                "limit": {"type": "integer", "default": 5},
             },
-            "required": ["period"],
         },
     },
     {
         "name": "get_top_policies",
         "description": (
-            "Return the most-triggered DLP policies in a given period. Use "
-            "this for 'most triggered policy today/this week' questions."
+            "Return the most frequently triggered DLP policies for a given period."
         ),
         "input_schema": {
             "type": "object",
@@ -59,44 +37,69 @@ TOOLS: list[dict] = [
                 "period": {
                     "type": "string",
                     "enum": ["today", "week", "month"],
+                    "default": "week",
                 },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "limit": {"type": "integer", "default": 5},
             },
-            "required": ["period"],
         },
     },
     {
-        "name": "get_os_breakdown",
+        "name": "get_detection_breakdown",
         "description": (
-            "Return the count of managed devices broken down by operating "
-            "system (macOS, Windows, Linux, ...). Use for 'MAC vs PC user "
-            "counts' or OS fleet composition questions."
+            "Return a count of detections grouped by sensor/detection type for the past week. "
+            "Categories include file_upload, usb, print, browser, email, etc."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
     {
-        "name": "get_license_usage",
+        "name": "get_top_risky_users",
         "description": (
-            "Return current FortiDLP license usage: seats used, total "
-            "purchased, and expiration if available."
-        ),
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "get_unhealthy_devices",
-        "description": (
-            "Return devices reported by FortiDLP as unhealthy, with the "
-            "reason and (where available) recommended remediation steps. "
-            "Use for 'which devices need attention' questions."
+            "Return users ranked by cumulative risk score from detections and incidents. "
+            "Higher scores indicate more severe or frequent policy violations."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "limit": {
-                    "type": "integer",
-                    "description": "Max devices to return (default 50).",
-                    "minimum": 1,
-                    "maximum": 500,
+                "period": {
+                    "type": "string",
+                    "enum": ["today", "week", "month"],
+                    "default": "week",
+                },
+                "limit": {"type": "integer", "default": 5},
+            },
+        },
+    },
+    {
+        "name": "get_top_devices",
+        "description": (
+            "Return endpoints (by hostname) with the most DLP detections. "
+            "Useful for identifying the noisiest or most at-risk machines."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "enum": ["today", "week", "month"],
+                    "default": "week",
+                },
+                "limit": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "get_event_summary",
+        "description": (
+            "Return a high-level summary of DLP activity: total events, unique users, "
+            "unique devices, and unique policies triggered for a given period."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "enum": ["today", "week", "month"],
+                    "default": "today",
                 },
             },
         },
@@ -104,46 +107,55 @@ TOOLS: list[dict] = [
 ]
 
 
-# --- dispatch functions ---
-
-
-async def _tool_get_top_users(args: dict, client: FortiDLPClient) -> Any:
+async def _tool_get_top_users(args: dict, client: Any) -> Any:
     return await client.top_users(
         period=args.get("period", "today"),
-        limit=args.get("limit", 10),
+        limit=int(args.get("limit", 5)),
     )
 
 
-async def _tool_get_top_policies(args: dict, client: FortiDLPClient) -> Any:
+async def _tool_get_top_policies(args: dict, client: Any) -> Any:
     return await client.top_policies(
-        period=args.get("period", "today"),
-        limit=args.get("limit", 10),
+        period=args.get("period", "week"),
+        limit=int(args.get("limit", 5)),
     )
 
 
-async def _tool_get_os_breakdown(args: dict, client: FortiDLPClient) -> Any:
-    return await client.os_breakdown()
+async def _tool_get_detection_breakdown(args: dict, client: Any) -> Any:
+    return await client.detection_breakdown()
 
 
-async def _tool_get_license_usage(args: dict, client: FortiDLPClient) -> Any:
-    return await client.license_usage()
+async def _tool_get_top_risky_users(args: dict, client: Any) -> Any:
+    return await client.top_risky_users(
+        period=args.get("period", "week"),
+        limit=int(args.get("limit", 5)),
+    )
 
 
-async def _tool_get_unhealthy_devices(args: dict, client: FortiDLPClient) -> Any:
-    return await client.unhealthy_devices(limit=args.get("limit", 50))
+async def _tool_get_top_devices(args: dict, client: Any) -> Any:
+    return await client.top_devices(
+        period=args.get("period", "week"),
+        limit=int(args.get("limit", 10)),
+    )
 
 
-DISPATCH: dict[str, ToolFn] = {
+async def _tool_get_event_summary(args: dict, client: Any) -> Any:
+    return await client.event_summary(period=args.get("period", "today"))
+
+
+DISPATCH: dict[str, Any] = {
     "get_top_users": _tool_get_top_users,
     "get_top_policies": _tool_get_top_policies,
-    "get_os_breakdown": _tool_get_os_breakdown,
-    "get_license_usage": _tool_get_license_usage,
-    "get_unhealthy_devices": _tool_get_unhealthy_devices,
+    "get_detection_breakdown": _tool_get_detection_breakdown,
+    "get_top_risky_users": _tool_get_top_risky_users,
+    "get_top_devices": _tool_get_top_devices,
+    "get_event_summary": _tool_get_event_summary,
 }
 
 
-async def run_tool(name: str, args: dict, client: FortiDLPClient) -> Any:
-    """Execute a whitelisted tool. Raises KeyError for unknown tools."""
-    fn = DISPATCH[name]
-    logger.info("tool_call name=%s args=%s", name, args)
+async def run_tool(name: str, args: dict, client: Any) -> Any:
+    fn = DISPATCH.get(name)
+    if fn is None:
+        raise ValueError(f"Unknown tool: {name!r}")
+    log.info("tool_call name=%s args=%s", name, json.dumps(args, default=str))
     return await fn(args, client)

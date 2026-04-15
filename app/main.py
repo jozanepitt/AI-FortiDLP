@@ -27,7 +27,8 @@ async def lifespan(app: FastAPI):
 
     fortidlp = FortiDLPClient(
         base_url=settings.fortidlp_base_url,
-        token=settings.fortidlp_token,
+        stream_id=settings.fortidlp_stream_id,
+        stream_token=settings.fortidlp_stream_token,
     )
     agent = ClaudeAgent(
         api_key=settings.anthropic_api_key,
